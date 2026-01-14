@@ -1,0 +1,39 @@
+# Android
+.gradle
+build/
+app/build/
+*.apk
+*.aab
+local.properties
+.idea/
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+*.iml
+*.hprof
+*.keystore
+*~
+**/.cxx/
+**/CMakeLists.txt.user
+**/build/
+
+# OBS Plugin / CMake
+# No build/ directory as it's typically within the plugin folder itself, handled by the general build/ignore
+**/CMakeCache.txt
+**/CMakeFiles/
+**/cmake_install.cmake
+**/Makefile
+**/*.so
+**/*.dll
+**/*.a
+**/CPackConfig.cmake
+**/CPackSourceConfig.cmake
+
+# General
+.DS_Store
+*.log
+*.tmp
+*.swp

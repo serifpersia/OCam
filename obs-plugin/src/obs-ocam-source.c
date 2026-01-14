@@ -1,0 +1,585 @@
+#include <obs-module.h>
+#include <util/platform.h>
+#include <util/threading.h>
+#include <util/dstr.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <endian.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <stdlib.h>
+
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/log.h>
+#include <libavutil/opt.h> // Required for av_opt_set
+
+#define VIDEO_PORT 27183
+#define CONTROL_PORT 27184
+#define NAME_BUFFER_SIZE 64
+
+static float befloattoh(uint32_t val) {
+    uint32_t host_val = be32toh(val);
+    float f;
+    memcpy(&f, &host_val, sizeof(float));
+    return f;
+}
+
+struct ocam_res {
+    int w;
+    int h;
+};
+
+struct ocam_source {
+    obs_source_t *source;
+
+    pthread_t network_thread;
+    pthread_t control_thread;
+    volatile bool thread_running;
+    bool network_thread_active;
+    bool control_thread_active;
+
+    int video_server_fd;
+    int video_client_fd;
+    int control_server_fd;
+    int control_client_fd;
+
+    pthread_mutex_t mutex;
+
+    struct ocam_res *supported_resolutions;
+    int supported_res_count;
+    int iso_min, iso_max;
+    int exp_min, exp_max;
+    float focus_min;
+    bool flash_available;
+    bool caps_received;
+
+    // Cache state
+    int current_w, current_h;
+    int current_fps;
+    int current_bitrate;
+    bool current_flash;
+    int current_iso;
+    int current_exp;
+    int current_focus;
+
+    uint32_t width;
+    uint32_t height;
+    AVCodecContext *codec_ctx;
+    AVFrame *decoded_frame;
+    uint8_t *extradata;
+    int extradata_size;
+    bool codec_initialized;
+    int64_t timestamp_offset;
+    bool first_frame_received;
+};
+
+static ssize_t read_bytes_fully(int fd, void *buf, size_t len) {
+    size_t total_read = 0;
+    while (total_read < len) {
+        ssize_t bytes_read = recv(fd, (char*)buf + total_read, len - total_read, 0);
+        if (bytes_read <= 0) return bytes_read;
+        total_read += bytes_read;
+    }
+    return total_read;
+}
+
+static void send_control_command(struct ocam_source *s, uint8_t cmd_id, uint32_t arg1, uint32_t arg2) {
+    pthread_mutex_lock(&s->mutex);
+    if (s->control_client_fd != -1) {
+        uint8_t buffer[9];
+        buffer[0] = cmd_id;
+        buffer[1] = (arg1 >> 24) & 0xFF; buffer[2] = (arg1 >> 16) & 0xFF; buffer[3] = (arg1 >> 8) & 0xFF; buffer[4] = (arg1) & 0xFF;
+        buffer[5] = (arg2 >> 24) & 0xFF; buffer[6] = (arg2 >> 16) & 0xFF; buffer[7] = (arg2 >> 8) & 0xFF; buffer[8] = (arg2) & 0xFF;
+        if (send(s->control_client_fd, buffer, 9, MSG_NOSIGNAL) < 0) {
+            blog(LOG_WARNING, "[OCAM] Send Error: %s", strerror(errno));
+        }
+    }
+    pthread_mutex_unlock(&s->mutex);
+}
+
+static int create_bind_socket(int port) {
+    int fd;
+    int opt = 1;
+    struct sockaddr_in address;
+
+    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) return -1;
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    #ifdef SO_REUSEPORT
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    #endif
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    int retries = 5;
+    while (retries > 0) {
+        if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+            blog(LOG_WARNING, "[OCAM] Bind retry port %d...", port);
+            sleep(1);
+            retries--;
+        } else {
+            return fd;
+        }
+    }
+    return -1;
+}
+
+// --- Control Thread ---
+
+static void sync_settings_to_phone(struct ocam_source *s) {
+    if (s->current_w > 0 && s->current_h > 0) {
+        send_control_command(s, 0x01, s->current_w, s->current_h);
+        usleep(50000);
+    }
+    if (s->current_fps > 0) send_control_command(s, 0x02, s->current_fps, 0);
+    if (s->current_bitrate > 0) send_control_command(s, 0x03, s->current_bitrate * 1000000, 0);
+
+    send_control_command(s, 0x09, s->current_flash ? 1 : 0, 0);
+    if (s->current_iso >= 0) send_control_command(s, 0x06, s->current_iso, 0);
+    if (s->current_exp >= 0) send_control_command(s, 0x07, s->current_exp, 0);
+    if (s->current_focus >= -1) send_control_command(s, 0x08, s->current_focus, 0);
+}
+
+static void *control_thread_func(void *data) {
+    struct ocam_source *s = data;
+
+    s->control_server_fd = create_bind_socket(CONTROL_PORT);
+    if (s->control_server_fd < 0) return NULL;
+    if (listen(s->control_server_fd, 1) < 0) { close(s->control_server_fd); return NULL; }
+
+    while (s->thread_running) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client = accept(s->control_server_fd, (struct sockaddr*)&client_addr, &client_len);
+
+        if (client < 0) continue;
+        if (!s->thread_running) { close(client); break; }
+
+        pthread_mutex_lock(&s->mutex);
+        s->control_client_fd = client;
+        pthread_mutex_unlock(&s->mutex);
+
+        blog(LOG_INFO, "[OCAM-CTRL] Connected. Syncing settings...");
+        sync_settings_to_phone(s);
+        send_control_command(s, 0x05, 0, 0);
+
+        while (s->thread_running) {
+            uint8_t header[5];
+            if (read_bytes_fully(client, header, 5) <= 0) break;
+
+            uint8_t pkt_type = header[0];
+            uint32_t payload_len = be32toh(*(uint32_t*)(header + 1));
+
+            if (pkt_type == 0x10) {
+                uint8_t *payload = malloc(payload_len);
+                if (read_bytes_fully(client, payload, payload_len) == payload_len) {
+
+                    pthread_mutex_lock(&s->mutex);
+                    int offset = 0;
+                    uint8_t res_count = payload[offset++];
+
+                    if (s->supported_resolutions) free(s->supported_resolutions);
+                    s->supported_resolutions = malloc(sizeof(struct ocam_res) * res_count);
+                    s->supported_res_count = res_count;
+
+                    for(int i=0; i<res_count; i++) {
+                        uint32_t w = be32toh(*(uint32_t*)(payload + offset)); offset += 4;
+                        uint32_t h = be32toh(*(uint32_t*)(payload + offset)); offset += 4;
+                        s->supported_resolutions[i].w = w;
+                        s->supported_resolutions[i].h = h;
+                    }
+
+                    s->iso_min = (int32_t)be32toh(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->iso_max = (int32_t)be32toh(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->exp_min = (int32_t)be32toh(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->exp_max = (int32_t)be32toh(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->focus_min = befloattoh(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->flash_available = payload[offset++];
+                    s->caps_received = true;
+                    pthread_mutex_unlock(&s->mutex);
+
+                    blog(LOG_INFO, "[OCAM] Capabilities updated.");
+                }
+                free(payload);
+            } else {
+                uint8_t *trash = malloc(payload_len);
+                read_bytes_fully(client, trash, payload_len);
+                free(trash);
+            }
+        }
+
+        pthread_mutex_lock(&s->mutex);
+        if (s->control_client_fd != -1) { close(s->control_client_fd); s->control_client_fd = -1; }
+        s->caps_received = false;
+        pthread_mutex_unlock(&s->mutex);
+    }
+    close(s->control_server_fd);
+    return NULL;
+}
+
+// --- Properties UI ---
+
+static obs_properties_t *ocam_get_properties(void *data) {
+    struct ocam_source *s = data;
+    obs_properties_t *props = obs_properties_create();
+
+    obs_property_t *list = obs_properties_add_list(props, "resolution", "Resolution", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    pthread_mutex_lock(&s->mutex);
+    if (s->caps_received && s->supported_res_count > 0) {
+        for (int i = 0; i < s->supported_res_count; i++) {
+            struct dstr label = {0};
+            dstr_printf(&label, "%dx%d", s->supported_resolutions[i].w, s->supported_resolutions[i].h);
+            obs_property_list_add_string(list, label.array, label.array);
+            dstr_free(&label);
+        }
+    } else {
+        obs_property_list_add_string(list, "1280x720", "1280x720");
+        obs_property_list_add_string(list, "1920x1080", "1920x1080");
+        if (!s->caps_received) obs_property_set_description(list, "Resolution (Connect phone to populate)");
+    }
+
+    obs_property_t *fps_list = obs_properties_add_list(props, "fps", "FPS", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(fps_list, "60 FPS", 60);
+    obs_property_list_add_int(fps_list, "30 FPS", 30);
+    obs_property_list_add_int(fps_list, "24 FPS", 24);
+    obs_property_list_add_int(fps_list, "15 FPS", 15);
+
+    obs_property_t *bit_list = obs_properties_add_list(props, "bitrate", "Bitrate", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(bit_list, "1 Mbps", 1);
+    obs_property_list_add_int(bit_list, "2 Mbps", 2);
+    obs_property_list_add_int(bit_list, "4 Mbps", 4);
+    obs_property_list_add_int(bit_list, "6 Mbps", 6);
+    obs_property_list_add_int(bit_list, "8 Mbps", 8);
+    obs_property_list_add_int(bit_list, "12 Mbps", 12);
+    obs_property_list_add_int(bit_list, "20 Mbps", 20);
+    obs_property_list_add_int(bit_list, "50 Mbps (High)", 50);
+
+    obs_properties_add_bool(props, "flash", "Flash / Torch");
+
+    obs_properties_t *manual_grp = obs_properties_create();
+    int iso_max = (s->caps_received && s->iso_max > 0) ? s->iso_max : 3200;
+    obs_properties_add_int_slider(manual_grp, "iso", "ISO (0=Auto)", 0, iso_max, 1);
+    int exp_max = (s->caps_received && s->exp_max > 0) ? s->exp_max : 100000;
+    obs_properties_add_int_slider(manual_grp, "exposure", "Exposure µs (0=Auto)", 0, exp_max, 100);
+    obs_properties_add_int_slider(manual_grp, "focus", "Focus (-1=Auto, 0-1000 Manual)", -1, 1000, 1);
+
+    pthread_mutex_unlock(&s->mutex);
+    obs_properties_add_group(props, "manual_controls", "Manual Controls", OBS_GROUP_NORMAL, manual_grp);
+    return props;
+}
+
+static void ocam_get_defaults(obs_data_t *settings) {
+    obs_data_set_default_string(settings, "resolution", "1280x720");
+    obs_data_set_default_int(settings, "fps", 30);
+    obs_data_set_default_int(settings, "bitrate", 2);
+    obs_data_set_default_bool(settings, "flash", false);
+    obs_data_set_default_int(settings, "iso", 0);
+    obs_data_set_default_int(settings, "exposure", 0);
+    obs_data_set_default_int(settings, "focus", -1);
+}
+
+static void ocam_update(void *data, obs_data_t *settings) {
+    struct ocam_source *s = data;
+
+    const char *res_str = obs_data_get_string(settings, "resolution");
+    int w = 0, h = 0;
+    if (sscanf(res_str, "%dx%d", &w, &h) == 2) {
+        if (w != s->current_w || h != s->current_h) {
+            blog(LOG_INFO, "[OCAM] Setting Resolution: %dx%d", w, h);
+            send_control_command(s, 0x01, w, h);
+            s->current_w = w; s->current_h = h;
+        }
+    }
+
+    int fps = (int)obs_data_get_int(settings, "fps");
+    if (fps != s->current_fps) {
+        blog(LOG_INFO, "[OCAM] Setting FPS: %d", fps);
+        send_control_command(s, 0x02, fps, 0);
+        s->current_fps = fps;
+    }
+
+    int bitrate_mbps = (int)obs_data_get_int(settings, "bitrate");
+    if (bitrate_mbps != s->current_bitrate) {
+        blog(LOG_INFO, "[OCAM] Setting Bitrate: %d Mbps", bitrate_mbps);
+        send_control_command(s, 0x03, bitrate_mbps * 1000000, 0);
+        s->current_bitrate = bitrate_mbps;
+    }
+
+    bool flash = obs_data_get_bool(settings, "flash");
+    if (flash != s->current_flash) {
+        send_control_command(s, 0x09, flash ? 1 : 0, 0);
+        s->current_flash = flash;
+    }
+
+    int iso = (int)obs_data_get_int(settings, "iso");
+    if (iso != s->current_iso) {
+        send_control_command(s, 0x06, iso, 0);
+        s->current_iso = iso;
+    }
+
+    int exp = (int)obs_data_get_int(settings, "exposure");
+    if (exp != s->current_exp) {
+        send_control_command(s, 0x07, exp, 0);
+        s->current_exp = exp;
+    }
+
+    int focus = (int)obs_data_get_int(settings, "focus");
+    if (focus != s->current_focus) {
+        send_control_command(s, 0x08, focus, 0);
+        s->current_focus = focus;
+    }
+}
+
+// --- FFmpeg & Video Thread ---
+
+static inline enum video_format convert_pixel_format(int f) {
+    switch (f) {
+        case AV_PIX_FMT_YUV420P: return VIDEO_FORMAT_I420;
+        case AV_PIX_FMT_YUVJ420P: return VIDEO_FORMAT_I420;
+        case AV_PIX_FMT_NV12: return VIDEO_FORMAT_NV12;
+        default: return VIDEO_FORMAT_NONE;
+    }
+}
+
+static inline enum video_colorspace convert_color_space(enum AVColorSpace s) {
+    switch (s) {
+        case AVCOL_SPC_BT709: return VIDEO_CS_709;
+        case AVCOL_SPC_SMPTE170M: return VIDEO_CS_601;
+        default: return VIDEO_CS_DEFAULT;
+    }
+}
+
+static void cleanup_ffmpeg(struct ocam_source *s) {
+    if (s->codec_ctx) { avcodec_free_context(&s->codec_ctx); s->codec_ctx = NULL; }
+    if (s->decoded_frame) { av_frame_free(&s->decoded_frame); s->decoded_frame = NULL; }
+    if (s->extradata) { free(s->extradata); s->extradata = NULL; }
+    s->extradata_size = 0;
+    s->codec_initialized = false;
+}
+
+static bool init_ffmpeg(struct ocam_source *s) {
+    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!codec) return false;
+
+    s->codec_ctx = avcodec_alloc_context3(codec);
+    if (s->extradata_size > 0) {
+        s->codec_ctx->extradata = (uint8_t*)av_malloc(s->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        memcpy(s->codec_ctx->extradata, s->extradata, s->extradata_size);
+        s->codec_ctx->extradata_size = s->extradata_size;
+    }
+
+    s->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+    // --- ZERO LATENCY FIX ---
+    av_opt_set(s->codec_ctx->priv_data, "tune", "zerolatency", 0);
+
+    s->decoded_frame = av_frame_alloc();
+
+    if (avcodec_open2(s->codec_ctx, codec, NULL) < 0) return false;
+
+    s->codec_initialized = true;
+    return true;
+}
+
+static void *network_thread_func(void *data) {
+    struct ocam_source *s = data;
+    AVPacket *packet = NULL;
+
+    s->video_server_fd = create_bind_socket(VIDEO_PORT);
+    if (s->video_server_fd < 0) return NULL;
+    if (listen(s->video_server_fd, 1) < 0) { close(s->video_server_fd); return NULL; }
+
+    while (s->thread_running) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client = accept(s->video_server_fd, (struct sockaddr*)&client_addr, &client_len);
+
+        if (client < 0) continue;
+        if (!s->thread_running) { close(client); break; }
+
+        pthread_mutex_lock(&s->mutex);
+        s->video_client_fd = client;
+        pthread_mutex_unlock(&s->mutex);
+
+        char name[NAME_BUFFER_SIZE];
+        uint32_t config[3];
+        if (read_bytes_fully(client, name, NAME_BUFFER_SIZE) <= 0 || read_bytes_fully(client, config, sizeof(config)) <= 0) {
+            close(client); continue;
+        }
+
+        blog(LOG_INFO, "[OCAM] Video Connection Established. Waiting for stream...");
+
+        cleanup_ffmpeg(s);
+        s->first_frame_received = false;
+        packet = av_packet_alloc();
+
+        while (s->thread_running) {
+            uint64_t pts_net;
+            uint32_t size_net;
+
+            if (read_bytes_fully(client, &pts_net, sizeof(pts_net)) <= 0) break;
+            if (read_bytes_fully(client, &size_net, sizeof(size_net)) <= 0) break;
+
+            uint64_t pts = be64toh(pts_net);
+            uint32_t size = be32toh(size_net);
+
+            if (av_new_packet(packet, size) < 0) break;
+            if (read_bytes_fully(client, packet->data, size) != size) { av_packet_unref(packet); break; }
+
+            // PTS 0 = Config Packet (Stream Restart)
+            // This is what the Android App MUST send when settings change
+            if (pts == 0) {
+                blog(LOG_INFO, "[OCAM] Config Packet (Stream Restart). Reseting Timestamps.");
+                uint8_t *new_ptr = realloc(s->extradata, s->extradata_size + size);
+                if (new_ptr) {
+                    s->extradata = new_ptr;
+                    memcpy(s->extradata + s->extradata_size, packet->data, size);
+                    s->extradata_size += size;
+                }
+
+                if (s->codec_initialized) {
+                    avcodec_flush_buffers(s->codec_ctx);
+                }
+                s->first_frame_received = false;
+            }
+
+            if (!s->codec_initialized) {
+                if (!init_ffmpeg(s)) { av_packet_unref(packet); break; }
+            }
+
+            int64_t pts_ns = (int64_t)pts * 1000;
+
+            if (!s->first_frame_received && pts > 0) {
+                s->timestamp_offset = (int64_t)os_gettime_ns() - pts_ns;
+                s->first_frame_received = true;
+            }
+
+            packet->pts = pts;
+            if (avcodec_send_packet(s->codec_ctx, packet) >= 0) {
+                while (avcodec_receive_frame(s->codec_ctx, s->decoded_frame) >= 0) {
+
+                    if ((uint32_t)s->decoded_frame->width != s->width || (uint32_t)s->decoded_frame->height != s->height) {
+                        s->width = (uint32_t)s->decoded_frame->width;
+                        s->height = (uint32_t)s->decoded_frame->height;
+                    }
+
+                    enum video_format obs_fmt = convert_pixel_format(s->decoded_frame->format);
+                    if (obs_fmt == VIDEO_FORMAT_NONE) continue;
+
+                    struct obs_source_frame obs_frame = {0};
+                    for (int i = 0; i < MAX_AV_PLANES; i++) {
+                        obs_frame.data[i] = s->decoded_frame->data[i];
+                        obs_frame.linesize[i] = abs(s->decoded_frame->linesize[i]);
+                    }
+                    obs_frame.format = obs_fmt;
+                    obs_frame.width = s->decoded_frame->width;
+                    obs_frame.height = s->decoded_frame->height;
+                    obs_frame.full_range = (s->decoded_frame->color_range == AVCOL_RANGE_JPEG);
+                    obs_frame.timestamp = pts_ns + s->timestamp_offset;
+
+                    enum video_colorspace cs = convert_color_space(s->decoded_frame->colorspace);
+                    video_format_get_parameters_for_format(cs, s->decoded_frame->color_range == AVCOL_RANGE_JPEG ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL,
+                                                           obs_fmt, obs_frame.color_matrix, obs_frame.color_range_min, obs_frame.color_range_max);
+
+                    obs_source_output_video(s->source, &obs_frame);
+                }
+            }
+            av_packet_unref(packet);
+        }
+
+        pthread_mutex_lock(&s->mutex);
+        if(s->video_client_fd != -1) { close(s->video_client_fd); s->video_client_fd = -1; }
+        pthread_mutex_unlock(&s->mutex);
+        if (packet) { av_packet_free(&packet); packet = NULL; }
+        cleanup_ffmpeg(s);
+    }
+    if (packet) av_packet_free(&packet);
+    close(s->video_server_fd);
+    return NULL;
+}
+
+static void force_unblock_socket(int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock >= 0) {
+        struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = inet_addr("127.0.0.1"), .sin_port = htons(port) };
+        connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+        close(sock);
+    }
+}
+
+static void ocam_destroy(void *data) {
+    struct ocam_source *s = data;
+    s->thread_running = false;
+
+    pthread_mutex_lock(&s->mutex);
+    if (s->video_client_fd != -1) { shutdown(s->video_client_fd, SHUT_RDWR); close(s->video_client_fd); s->video_client_fd = -1; }
+    if (s->control_client_fd != -1) { shutdown(s->control_client_fd, SHUT_RDWR); close(s->control_client_fd); s->control_client_fd = -1; }
+    if (s->video_server_fd != -1) { shutdown(s->video_server_fd, SHUT_RDWR); close(s->video_server_fd); s->video_server_fd = -1; }
+    if (s->control_server_fd != -1) { shutdown(s->control_server_fd, SHUT_RDWR); close(s->control_server_fd); s->control_server_fd = -1; }
+    pthread_mutex_unlock(&s->mutex);
+
+    force_unblock_socket(VIDEO_PORT);
+    force_unblock_socket(CONTROL_PORT);
+
+    if (s->network_thread_active) pthread_join(s->network_thread, NULL);
+    if (s->control_thread_active) pthread_join(s->control_thread, NULL);
+
+    if (s->supported_resolutions) free(s->supported_resolutions);
+    pthread_mutex_destroy(&s->mutex);
+    cleanup_ffmpeg(s);
+    bfree(s);
+}
+
+static void *ocam_create(obs_data_t *settings, obs_source_t *source) {
+    UNUSED_PARAMETER(settings);
+    struct ocam_source *s = bzalloc(sizeof(struct ocam_source));
+    s->source = source;
+    s->thread_running = true;
+    s->video_server_fd = -1; s->video_client_fd = -1;
+    s->control_server_fd = -1; s->control_client_fd = -1;
+
+    // Init Cache
+    s->current_w = -1; s->current_h = -1;
+    s->current_fps = -1; s->current_bitrate = -1;
+    s->current_iso = -1; s->current_exp = -1; s->current_focus = -100;
+
+    pthread_mutex_init(&s->mutex, NULL);
+
+    if (pthread_create(&s->network_thread, NULL, network_thread_func, s) == 0) s->network_thread_active = true;
+    if (pthread_create(&s->control_thread, NULL, control_thread_func, s) == 0) s->control_thread_active = true;
+
+    ocam_update(s, settings);
+    return s;
+}
+
+static const char *ocam_get_name(void *unused) { UNUSED_PARAMETER(unused); return "OCam Source"; }
+static uint32_t ocam_get_width(void *data) { struct ocam_source *s = data; return s->width ? s->width : 1280; }
+static uint32_t ocam_get_height(void *data) { struct ocam_source *s = data; return s->height ? s->height : 720; }
+
+static struct obs_source_info ocam_source_info = {
+    .id = "ocam_source",
+    .type = OBS_SOURCE_TYPE_INPUT,
+    .output_flags = OBS_SOURCE_ASYNC_VIDEO,
+    .get_name = ocam_get_name,
+    .create = ocam_create,
+    .destroy = ocam_destroy,
+    .get_width = ocam_get_width,
+    .get_height = ocam_get_height,
+    .update = ocam_update,
+    .get_properties = ocam_get_properties,
+    .get_defaults = ocam_get_defaults,
+    .icon_type = OBS_ICON_TYPE_CAMERA,
+};
+
+OBS_DECLARE_MODULE()
+OBS_MODULE_USE_DEFAULT_LOCALE("obs-ocam-source", "en-US")
+bool obs_module_load(void) { obs_register_source(&ocam_source_info); return true; }
+void obs_module_unload(void) {}
