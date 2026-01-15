@@ -38,3 +38,5 @@ local.properties
 *.tmp
 *.swp
 /obs-plugin/.deps
+/android/app/release
+obs-plugin/cmake/.CMakeBuildNumber
