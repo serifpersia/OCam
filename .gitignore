@@ -40,3 +40,6 @@ local.properties
 /obs-plugin/.deps
 /android/app/release
 obs-plugin/cmake/.CMakeBuildNumber
+/.venv
+obs-plugin/cmake/.CMakeBuildNumber
+obs-plugin/cmake/.CMakeBuildNumber

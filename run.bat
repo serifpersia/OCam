@@ -88,6 +88,7 @@ goto main_menu
 echo Starting adb reverse...
 adb reverse tcp:27183 tcp:27183
 adb reverse tcp:27184 tcp:27184
+adb reverse tcp:27185 tcp:27185
 echo ADB reverse started. Press any key to stop and return to the menu.
 pause >nul
 adb reverse --remove-all

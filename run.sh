@@ -78,6 +78,7 @@ start_adb_reverse() {
     echo "Starting adb reverse..."
     adb reverse tcp:27183 tcp:27183
     adb reverse tcp:27184 tcp:27184
+    adb reverse tcp:27185 tcp:27185
     echo "ADB reverse started. Press 'q' to stop and return to the menu."
     while true; do
         read -rsn1 key
