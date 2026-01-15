@@ -3,6 +3,7 @@ package com.example.ocam
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
@@ -14,17 +15,18 @@ class ControlServer(
     private val context: Context,
     private val streamer: CameraStreamer
 ) {
-    private val PORT = 27184
+    private val port = 27184
     private var running = true
 
+    @OptIn(DelicateCoroutinesApi::class)
     fun start() {
         running = true
         GlobalScope.launch(Dispatchers.IO) {
             while (running) {
                 try {
-                    val socket = Socket("127.0.0.1", PORT)
+                    val socket = Socket("127.0.0.1", port)
                     handleConnection(socket)
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     Thread.sleep(2000)
                 }
             }
@@ -71,7 +73,7 @@ class ControlServer(
                     }
                 }
             }
-        } catch (e: Exception) { }
+        } catch (_: Exception) { }
     }
 
     private fun sendCapabilities(output: DataOutputStream) {
