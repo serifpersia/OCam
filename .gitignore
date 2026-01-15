@@ -37,3 +37,4 @@ local.properties
 *.log
 *.tmp
 *.swp
+/obs-plugin/.deps

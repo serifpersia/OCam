@@ -2,11 +2,37 @@
 #include <util/platform.h>
 #include <util/threading.h>
 #include <util/dstr.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <endian.h>
-#include <unistd.h>
+
+/* --- Platform Specific Includes & Definitions --- */
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+
+    #define CLOSESOCKET closesocket
+    #define SHUTDOWN_FLAGS SD_BOTH
+    #define MSG_NOSIGNAL 0
+    
+    // Windows setsockopt takes const char*
+    #define SOCKOPT_VAL_TYPE const char* 
+    
+    // MSVC doesn't define ssize_t by default
+    #include <BaseTsd.h>
+    typedef SSIZE_T ssize_t;
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <netdb.h>
+
+    #define CLOSESOCKET close
+    #define SHUTDOWN_FLAGS SHUT_RDWR
+    
+    // Linux setsockopt takes void*
+    #define SOCKOPT_VAL_TYPE void*
+#endif
+
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
@@ -17,14 +43,27 @@
 #include <libavutil/frame.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
-#include <libavutil/opt.h> // Required for av_opt_set
+#include <libavutil/opt.h>
 
 #define VIDEO_PORT 27183
 #define CONTROL_PORT 27184
 #define NAME_BUFFER_SIZE 64
 
+/* --- Endianness Helpers (Portable) --- */
+// Network to Host (32-bit) - ntohl is standard on Win/Lin
+static inline uint32_t portable_ntohl(uint32_t val) {
+    return ntohl(val);
+}
+
+// Network to Host (64-bit) - Custom implementation to avoid non-standard headers
+static inline uint64_t portable_ntohll(uint64_t val) {
+    uint32_t high = (uint32_t)(val >> 32);
+    uint32_t low  = (uint32_t)(val & 0xFFFFFFFF);
+    return ((uint64_t)ntohl(low) << 32) | ntohl(high);
+}
+
 static float befloattoh(uint32_t val) {
-    uint32_t host_val = be32toh(val);
+    uint32_t host_val = portable_ntohl(val);
     float f;
     memcpy(&f, &host_val, sizeof(float));
     return f;
@@ -82,7 +121,9 @@ struct ocam_source {
 static ssize_t read_bytes_fully(int fd, void *buf, size_t len) {
     size_t total_read = 0;
     while (total_read < len) {
-        ssize_t bytes_read = recv(fd, (char*)buf + total_read, len - total_read, 0);
+        // cast buf to char* for pointer arithmetic
+        // recv expects char* on Windows, void* on Linux. char* works for both.
+        ssize_t bytes_read = recv(fd, (char*)buf + total_read, (int)(len - total_read), 0);
         if (bytes_read <= 0) return bytes_read;
         total_read += bytes_read;
     }
@@ -96,8 +137,10 @@ static void send_control_command(struct ocam_source *s, uint8_t cmd_id, uint32_t
         buffer[0] = cmd_id;
         buffer[1] = (arg1 >> 24) & 0xFF; buffer[2] = (arg1 >> 16) & 0xFF; buffer[3] = (arg1 >> 8) & 0xFF; buffer[4] = (arg1) & 0xFF;
         buffer[5] = (arg2 >> 24) & 0xFF; buffer[6] = (arg2 >> 16) & 0xFF; buffer[7] = (arg2 >> 8) & 0xFF; buffer[8] = (arg2) & 0xFF;
-        if (send(s->control_client_fd, buffer, 9, MSG_NOSIGNAL) < 0) {
-            blog(LOG_WARNING, "[OCAM] Send Error: %s", strerror(errno));
+        
+        // Use MSG_NOSIGNAL (defined to 0 on Windows)
+        if (send(s->control_client_fd, (const char*)buffer, 9, MSG_NOSIGNAL) < 0) {
+            blog(LOG_WARNING, "[OCAM] Send Error: Connection lost");
         }
     }
     pthread_mutex_unlock(&s->mutex);
@@ -108,11 +151,13 @@ static int create_bind_socket(int port) {
     int opt = 1;
     struct sockaddr_in address;
 
-    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) return -1;
+    if ((fd = (int)socket(AF_INET, SOCK_STREAM, 0)) == 0) return -1;
 
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // Casting &opt to SOCKOPT_VAL_TYPE handles const char* vs void* diffs
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
+    
     #ifdef SO_REUSEPORT
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
     #endif
 
     address.sin_family = AF_INET;
@@ -123,7 +168,7 @@ static int create_bind_socket(int port) {
     while (retries > 0) {
         if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
             blog(LOG_WARNING, "[OCAM] Bind retry port %d...", port);
-            sleep(1);
+            os_sleep_ms(1000); // Changed to OBS cross-platform sleep
             retries--;
         } else {
             return fd;
@@ -137,7 +182,7 @@ static int create_bind_socket(int port) {
 static void sync_settings_to_phone(struct ocam_source *s) {
     if (s->current_w > 0 && s->current_h > 0) {
         send_control_command(s, 0x01, s->current_w, s->current_h);
-        usleep(50000);
+        os_sleep_ms(50);
     }
     if (s->current_fps > 0) send_control_command(s, 0x02, s->current_fps, 0);
     if (s->current_bitrate > 0) send_control_command(s, 0x03, s->current_bitrate * 1000000, 0);
@@ -153,15 +198,15 @@ static void *control_thread_func(void *data) {
 
     s->control_server_fd = create_bind_socket(CONTROL_PORT);
     if (s->control_server_fd < 0) return NULL;
-    if (listen(s->control_server_fd, 1) < 0) { close(s->control_server_fd); return NULL; }
+    if (listen(s->control_server_fd, 1) < 0) { CLOSESOCKET(s->control_server_fd); return NULL; }
 
     while (s->thread_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client = accept(s->control_server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client = (int)accept(s->control_server_fd, (struct sockaddr*)&client_addr, &client_len);
 
         if (client < 0) continue;
-        if (!s->thread_running) { close(client); break; }
+        if (!s->thread_running) { CLOSESOCKET(client); break; }
 
         pthread_mutex_lock(&s->mutex);
         s->control_client_fd = client;
@@ -176,7 +221,7 @@ static void *control_thread_func(void *data) {
             if (read_bytes_fully(client, header, 5) <= 0) break;
 
             uint8_t pkt_type = header[0];
-            uint32_t payload_len = be32toh(*(uint32_t*)(header + 1));
+            uint32_t payload_len = portable_ntohl(*(uint32_t*)(header + 1));
 
             if (pkt_type == 0x10) {
                 uint8_t *payload = malloc(payload_len);
@@ -191,16 +236,16 @@ static void *control_thread_func(void *data) {
                     s->supported_res_count = res_count;
 
                     for(int i=0; i<res_count; i++) {
-                        uint32_t w = be32toh(*(uint32_t*)(payload + offset)); offset += 4;
-                        uint32_t h = be32toh(*(uint32_t*)(payload + offset)); offset += 4;
+                        uint32_t w = portable_ntohl(*(uint32_t*)(payload + offset)); offset += 4;
+                        uint32_t h = portable_ntohl(*(uint32_t*)(payload + offset)); offset += 4;
                         s->supported_resolutions[i].w = w;
                         s->supported_resolutions[i].h = h;
                     }
 
-                    s->iso_min = (int32_t)be32toh(*(uint32_t*)(payload + offset)); offset += 4;
-                    s->iso_max = (int32_t)be32toh(*(uint32_t*)(payload + offset)); offset += 4;
-                    s->exp_min = (int32_t)be32toh(*(uint32_t*)(payload + offset)); offset += 4;
-                    s->exp_max = (int32_t)be32toh(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->iso_min = (int32_t)portable_ntohl(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->iso_max = (int32_t)portable_ntohl(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->exp_min = (int32_t)portable_ntohl(*(uint32_t*)(payload + offset)); offset += 4;
+                    s->exp_max = (int32_t)portable_ntohl(*(uint32_t*)(payload + offset)); offset += 4;
                     s->focus_min = befloattoh(*(uint32_t*)(payload + offset)); offset += 4;
                     s->flash_available = payload[offset++];
                     s->caps_received = true;
@@ -217,11 +262,11 @@ static void *control_thread_func(void *data) {
         }
 
         pthread_mutex_lock(&s->mutex);
-        if (s->control_client_fd != -1) { close(s->control_client_fd); s->control_client_fd = -1; }
+        if (s->control_client_fd != -1) { CLOSESOCKET(s->control_client_fd); s->control_client_fd = -1; }
         s->caps_received = false;
         pthread_mutex_unlock(&s->mutex);
     }
-    close(s->control_server_fd);
+    CLOSESOCKET(s->control_server_fd);
     return NULL;
 }
 
@@ -395,15 +440,15 @@ static void *network_thread_func(void *data) {
 
     s->video_server_fd = create_bind_socket(VIDEO_PORT);
     if (s->video_server_fd < 0) return NULL;
-    if (listen(s->video_server_fd, 1) < 0) { close(s->video_server_fd); return NULL; }
+    if (listen(s->video_server_fd, 1) < 0) { CLOSESOCKET(s->video_server_fd); return NULL; }
 
     while (s->thread_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client = accept(s->video_server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client = (int)accept(s->video_server_fd, (struct sockaddr*)&client_addr, &client_len);
 
         if (client < 0) continue;
-        if (!s->thread_running) { close(client); break; }
+        if (!s->thread_running) { CLOSESOCKET(client); break; }
 
         pthread_mutex_lock(&s->mutex);
         s->video_client_fd = client;
@@ -412,7 +457,7 @@ static void *network_thread_func(void *data) {
         char name[NAME_BUFFER_SIZE];
         uint32_t config[3];
         if (read_bytes_fully(client, name, NAME_BUFFER_SIZE) <= 0 || read_bytes_fully(client, config, sizeof(config)) <= 0) {
-            close(client); continue;
+            CLOSESOCKET(client); continue;
         }
 
         blog(LOG_INFO, "[OCAM] Video Connection Established. Waiting for stream...");
@@ -428,14 +473,13 @@ static void *network_thread_func(void *data) {
             if (read_bytes_fully(client, &pts_net, sizeof(pts_net)) <= 0) break;
             if (read_bytes_fully(client, &size_net, sizeof(size_net)) <= 0) break;
 
-            uint64_t pts = be64toh(pts_net);
-            uint32_t size = be32toh(size_net);
+            uint64_t pts = portable_ntohll(pts_net);
+            uint32_t size = portable_ntohl(size_net);
 
             if (av_new_packet(packet, size) < 0) break;
             if (read_bytes_fully(client, packet->data, size) != size) { av_packet_unref(packet); break; }
 
             // PTS 0 = Config Packet (Stream Restart)
-            // This is what the Android App MUST send when settings change
             if (pts == 0) {
                 blog(LOG_INFO, "[OCAM] Config Packet (Stream Restart). Reseting Timestamps.");
                 uint8_t *new_ptr = realloc(s->extradata, s->extradata_size + size);
@@ -496,22 +540,28 @@ static void *network_thread_func(void *data) {
         }
 
         pthread_mutex_lock(&s->mutex);
-        if(s->video_client_fd != -1) { close(s->video_client_fd); s->video_client_fd = -1; }
+        if(s->video_client_fd != -1) { CLOSESOCKET(s->video_client_fd); s->video_client_fd = -1; }
         pthread_mutex_unlock(&s->mutex);
         if (packet) { av_packet_free(&packet); packet = NULL; }
         cleanup_ffmpeg(s);
     }
     if (packet) av_packet_free(&packet);
-    close(s->video_server_fd);
+    CLOSESOCKET(s->video_server_fd);
     return NULL;
 }
 
 static void force_unblock_socket(int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (sock >= 0) {
-        struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = inet_addr("127.0.0.1"), .sin_port = htons(port) };
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        // "127.0.0.1" in hex is 0x7F000001
+        addr.sin_addr.s_addr = htonl(0x7F000001); 
+
         connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-        close(sock);
+        CLOSESOCKET(sock);
     }
 }
 
@@ -520,10 +570,10 @@ static void ocam_destroy(void *data) {
     s->thread_running = false;
 
     pthread_mutex_lock(&s->mutex);
-    if (s->video_client_fd != -1) { shutdown(s->video_client_fd, SHUT_RDWR); close(s->video_client_fd); s->video_client_fd = -1; }
-    if (s->control_client_fd != -1) { shutdown(s->control_client_fd, SHUT_RDWR); close(s->control_client_fd); s->control_client_fd = -1; }
-    if (s->video_server_fd != -1) { shutdown(s->video_server_fd, SHUT_RDWR); close(s->video_server_fd); s->video_server_fd = -1; }
-    if (s->control_server_fd != -1) { shutdown(s->control_server_fd, SHUT_RDWR); close(s->control_server_fd); s->control_server_fd = -1; }
+    if (s->video_client_fd != -1) { shutdown(s->video_client_fd, SHUTDOWN_FLAGS); CLOSESOCKET(s->video_client_fd); s->video_client_fd = -1; }
+    if (s->control_client_fd != -1) { shutdown(s->control_client_fd, SHUTDOWN_FLAGS); CLOSESOCKET(s->control_client_fd); s->control_client_fd = -1; }
+    if (s->video_server_fd != -1) { shutdown(s->video_server_fd, SHUTDOWN_FLAGS); CLOSESOCKET(s->video_server_fd); s->video_server_fd = -1; }
+    if (s->control_server_fd != -1) { shutdown(s->control_server_fd, SHUTDOWN_FLAGS); CLOSESOCKET(s->control_server_fd); s->control_server_fd = -1; }
     pthread_mutex_unlock(&s->mutex);
 
     force_unblock_socket(VIDEO_PORT);

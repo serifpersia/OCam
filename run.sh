@@ -2,7 +2,7 @@
 
 # Function to check if a command exists
 command_exists() {
-    command -v "$1" >/dev/null 2>&1
+    command -v "" >/dev/null 2>&1
 }
 
 # Function to check for adb
@@ -16,26 +16,31 @@ check_adb() {
 
 # Function to build the OBS plugin
 build_obs_plugin() {
-    echo "Building OBS plugin..."
+    echo "Building and installing OBS plugin..."
     # Remove previous build directory to ensure a clean build
     if [ -d "obs-plugin/build" ]; then
         rm -rf "obs-plugin/build"
     fi
     mkdir -p obs-plugin/build
     cd obs-plugin/build
-    cmake ..
-    make
+    cmake .. -DCMAKE_BUILD_TYPE=Release
+    cmake --build . --config Release
+    
+    # Check for Linux and install to the correct user directory
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        echo "Installing plugin for Linux..."
+        PLUGIN_DIR="$HOME/.config/obs-studio/plugins/obs-ocam-source/bin/64bit"
+        mkdir -p "$PLUGIN_DIR"
+        # The output file is obs-ocam-source.so
+        cp "obs-ocam-source.so" "$PLUGIN_DIR/"
+        echo "Plugin installed to $PLUGIN_DIR"
+    else
+        # For other OSes, fallback to the default install command
+        cmake --install . --config Release
+    fi
+    
     cd ../..
-    echo "OBS plugin built successfully."
-}
-
-# Function to copy the OBS plugin
-copy_obs_plugin() {
-    echo "Copying OBS plugin..."
-    PLUGIN_DIR="$HOME/.config/obs-studio/plugins/obs-ocam-source/bin/64bit"
-    mkdir -p "$PLUGIN_DIR"
-    cp obs-plugin/build/obs-ocam-source.so "$PLUGIN_DIR/"
-    echo "OBS plugin copied to $PLUGIN_DIR"
+    echo "OBS plugin built and installed successfully."
 }
 
 # Function to install the Android app
@@ -72,6 +77,43 @@ start_adb_reverse() {
     echo "ADB reverse stopped."
 }
 
+# Function to fetch the latest release
+fetch_latest_release() {
+    echo "Fetching latest release..."
+    if ! command_exists curl; then
+        echo "curl is not installed. Please install curl."
+        exit 1
+    fi
+    if ! command_exists jq; then
+        echo "jq is not installed. Please install jq."
+        exit 1
+    fi
+
+    API_URL="https://api.github.com/repos/serifpersia/OCam/releases/latest"
+    DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name == "OCam.zip") | .browser_download_url')
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        echo "Could not find the latest release zip file."
+        exit 1
+    fi
+
+    echo "Downloading from $DOWNLOAD_URL"
+    curl -L -o OCam.zip "$DOWNLOAD_URL"
+
+    if ! command_exists unzip; then
+        echo "unzip is not installed. Please install unzip."
+        exit 1
+    fi
+    
+    if [ -d "release" ]; then
+        rm -rf "release"
+    fi
+    mkdir -p release
+    unzip OCam.zip -d release
+    rm OCam.zip
+    echo "Latest release downloaded and extracted to 'release' directory."
+}
+
 # Main menu
 main_menu() {
     while true; do
@@ -79,10 +121,10 @@ main_menu() {
         echo " OCam Control Panel "
         echo "--------------------"
         echo "1. Check ADB"
-        echo "2. Build OBS Plugin"
-        echo "3. Copy OBS Plugin"
-        echo "4. Install Android App"
-        echo "5. Start ADB Reverse"
+        echo "2. Build and Install OBS Plugin"
+        echo "3. Install Android App"
+        echo "4. Start ADB Reverse"
+        echo "5. Fetch Latest Release"
         echo "q. Quit"
         echo "Enter your choice:"
         read -r choice
@@ -90,9 +132,9 @@ main_menu() {
         case $choice in
             1) check_adb ;;
             2) build_obs_plugin ;;
-            3) copy_obs_plugin ;;
-            4) install_android_app ;;
-            5) start_adb_reverse ;;
+            3) install_android_app ;;
+            4) start_adb_reverse ;;
+            5) fetch_latest_release ;;
             q) break ;;
             *) echo "Invalid choice. Please try again." ;;
         esac

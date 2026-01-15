@@ -214,6 +214,7 @@ function(_check_dependencies)
       set(_obs_version ${version})
       set(_obs_destination "${destination}")
       list(APPEND CMAKE_PREFIX_PATH "${dependencies_dir}")
+      list(APPEND CMAKE_MODULE_PATH "${dependencies_dir}/${destination}/cmake/finders")
     endif()
 
     message(STATUS "Setting up ${label} (${arch}) - done")
@@ -222,6 +223,7 @@ function(_check_dependencies)
   list(REMOVE_DUPLICATES CMAKE_PREFIX_PATH)
 
   set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} CACHE PATH "CMake prefix search path" FORCE)
+  set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} CACHE PATH "CMake module search path" FORCE)
 
   _setup_obs_studio()
 endfunction()
