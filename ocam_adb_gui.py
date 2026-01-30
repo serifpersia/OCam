@@ -256,7 +256,7 @@ class MainWindow(QMainWindow):
             self.refresh_devices()
 
     def toggle_global_reverse_ports(self, checked):
-        ports = [27183, 27184]
+        ports = [27183, 27184, 27185]
         
         # Pause refresh timer to prevent race conditions during adb operations
         if hasattr(self, 'timer'):
