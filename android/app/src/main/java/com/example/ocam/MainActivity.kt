@@ -368,7 +368,7 @@ fun DropdownDeviceSelector(
 
     ExposedDropdownMenuBox(
         expanded = expanded,
-        onExpandedChange = { if (enabled) !expanded }
+        onExpandedChange = { if (enabled) expanded = it }
     ) {
         OutlinedTextField(
             value = selected?.name ?: "Select Device",
