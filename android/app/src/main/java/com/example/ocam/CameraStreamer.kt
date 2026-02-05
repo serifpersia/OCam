@@ -57,6 +57,9 @@ class CameraStreamer(
     var config = StreamConfig()
     var manual = ManualControls()
     private var isStreaming = false
+    
+    // Optimization: Reusable buffer
+    private var sendBuffer = ByteArray(65536)
 
     private fun validateAndClampConfig() {
         try {
@@ -317,10 +320,13 @@ class CameraStreamer(
             outputStream.writeInt(info.size)
 
             // Write Data
-            val bytes = ByteArray(info.size)
+            if (sendBuffer.size < info.size) {
+                 sendBuffer = ByteArray(info.size + 1024)
+            }
+            
             buffer.position(info.offset)
-            buffer.get(bytes)
-            outputStream.write(bytes)
+            buffer.get(sendBuffer, 0, info.size)
+            outputStream.write(sendBuffer, 0, info.size)
             outputStream.flush()
         } catch (_: Exception) {
             // Connection lost

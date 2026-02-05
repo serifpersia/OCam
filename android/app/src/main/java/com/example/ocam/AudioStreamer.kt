@@ -37,6 +37,12 @@ class AudioStreamer(
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
     private val bitrate = 128000 // 128kbps
 
+    // Optimization: Reusable buffers
+    private val rawBuffer = ByteArray(4096)
+    private var processedBuffer = ByteArray(4096)
+    private var sendBuffer = ByteArray(4096)
+    private var shortBuffer = ShortArray(2048)
+
     @SuppressLint("MissingPermission")
     fun start() {
         if (isStreaming) return
@@ -75,8 +81,7 @@ class AudioStreamer(
 
             streamingThread = Thread {
                 val bufferInfo = MediaCodec.BufferInfo()
-                val rawBuffer = ByteArray(4096)
-
+                
                 try {
                     while (isStreaming) {
                         // 1. Read Raw Audio
@@ -84,8 +89,9 @@ class AudioStreamer(
 
                         if (readBytes > 0) {
                             // 1.5 Apply Volume Gain (PCM manipulation)
-                            val processedBuffer = if (volume != 1.0f) {
+                            val inputBuffer = if (volume != 1.0f) {
                                 applyGain(rawBuffer, readBytes, volume)
+                                processedBuffer
                             } else {
                                 rawBuffer
                             }
@@ -95,7 +101,7 @@ class AudioStreamer(
                             if (inputIndex >= 0) {
                                 val codecBuffer = mediaCodec?.getInputBuffer(inputIndex)
                                 codecBuffer?.clear()
-                                codecBuffer?.put(processedBuffer, 0, readBytes)
+                                codecBuffer?.put(inputBuffer, 0, readBytes)
                                 val pts = System.nanoTime() / 1000
                                 mediaCodec?.queueInputBuffer(inputIndex, 0, readBytes, pts, 0)
                             }
@@ -125,42 +131,40 @@ class AudioStreamer(
         }
     }
 
-    private fun applyGain(audioData: ByteArray, size: Int, gain: Float): ByteArray {
-        val shortBuffer = ShortArray(size / 2)
+    private fun applyGain(audioData: ByteArray, size: Int, gain: Float) {
+        val shortCount = size / 2
+        if (shortBuffer.size < shortCount) shortBuffer = ShortArray(shortCount + 1024)
+        if (processedBuffer.size < size) processedBuffer = ByteArray(size + 1024)
+
         // bytes to shorts (Little Endian)
-        for (i in 0 until size / 2) {
+        for (i in 0 until shortCount) {
             val byte1 = audioData[i * 2].toInt() and 0xFF
             val byte2 = audioData[i * 2 + 1].toInt() and 0xFF
             shortBuffer[i] = ((byte2 shl 8) or byte1).toShort()
         }
 
-        // apply gain
-        for (i in shortBuffer.indices) {
+        // apply gain & shorts to bytes
+        for (i in 0 until shortCount) {
             var sample = (shortBuffer[i] * gain).toInt()
             // Clamp to 16-bit range
             if (sample > 32767) sample = 32767
             if (sample < -32768) sample = -32768
-            shortBuffer[i] = sample.toShort()
+            
+            processedBuffer[i * 2] = (sample and 0xFF).toByte()
+            processedBuffer[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
         }
-
-        // shorts to bytes
-        val outBytes = ByteArray(size) // Create new or reuse if optimization needed
-        for (i in 0 until size / 2) {
-            val sample = shortBuffer[i].toInt()
-            outBytes[i * 2] = (sample and 0xFF).toByte()
-            outBytes[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
-        }
-        return outBytes
     }
 
     private fun sendPacket(buffer: ByteBuffer, info: MediaCodec.BufferInfo) {
         try {
             outputStream.writeLong(info.presentationTimeUs)
             outputStream.writeInt(info.size)
-            val bytes = ByteArray(info.size)
+            
+            if (sendBuffer.size < info.size) sendBuffer = ByteArray(info.size + 1024)
+            
             buffer.position(info.offset)
-            buffer.get(bytes)
-            outputStream.write(bytes)
+            buffer.get(sendBuffer, 0, info.size)
+            outputStream.write(sendBuffer, 0, info.size)
             outputStream.flush()
         } catch (_: Exception) {
             stop()
