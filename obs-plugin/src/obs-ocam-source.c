@@ -22,6 +22,7 @@
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
+    #include <netinet/tcp.h> // TCP_NODELAY
     #include <arpa/inet.h>
     #include <unistd.h>
     #include <netdb.h>
@@ -173,6 +174,9 @@ static int create_bind_socket(int port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
     #endif
 
+    // Enable TCP_NODELAY for lower latency
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
+
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
@@ -211,6 +215,8 @@ static void *control_thread_func(void *data) {
     if (s->control_server_fd < 0) return NULL;
     if (listen(s->control_server_fd, 1) < 0) { CLOSESOCKET(s->control_server_fd); return NULL; }
 
+    uint8_t trash_buffer[1024];
+
     while (s->thread_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -218,6 +224,10 @@ static void *control_thread_func(void *data) {
 
         if (client < 0) continue;
         if (!s->thread_running) { CLOSESOCKET(client); break; }
+        
+        // TCP_NODELAY
+        int opt = 1;
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
 
         pthread_mutex_lock(&s->mutex);
         s->control_client_fd = client;
@@ -267,9 +277,12 @@ static void *control_thread_func(void *data) {
                 }
                 free(payload);
             } else {
-                uint8_t *trash = malloc(payload_len);
-                read_bytes_fully(client, trash, payload_len);
-                free(trash);
+                size_t remaining = payload_len;
+                while(remaining > 0) {
+                    size_t to_read = (remaining > sizeof(trash_buffer)) ? sizeof(trash_buffer) : remaining;
+                    if (read_bytes_fully(client, trash_buffer, to_read) <= 0) break;
+                    remaining -= to_read;
+                }
             }
         }
 
@@ -456,6 +469,10 @@ static void *network_thread_func(void *data) {
 
         if (client < 0) continue;
         if (!s->thread_running) { CLOSESOCKET(client); break; }
+        
+        // TCP_NODELAY
+        int opt = 1;
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
 
         pthread_mutex_lock(&s->mutex);
         s->video_client_fd = client;
@@ -597,6 +614,10 @@ static void *audio_thread_func(void *data) {
 
         if (client < 0) continue;
         if (!s->thread_running) { CLOSESOCKET(client); break; }
+        
+        // TCP_NODELAY
+        int opt = 1;
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
 
         pthread_mutex_lock(&s->mutex);
         s->audio_client_fd = client;
