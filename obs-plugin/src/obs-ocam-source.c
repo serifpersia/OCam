@@ -22,7 +22,7 @@
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
-    #include <netinet/tcp.h> // TCP_NODELAY
+    #include <netinet/tcp.h>
     #include <arpa/inet.h>
     #include <unistd.h>
     #include <netdb.h>
@@ -137,14 +137,40 @@ struct ocam_source {
     bool first_audio_received;
 };
 
-static ssize_t read_bytes_fully(int fd, void *buf, size_t len) {
+// Helper: Wait for data or timeout, returning false if thread stops
+static bool wait_for_socket(int fd, struct ocam_source *s, bool read) {
+    while (s->thread_running) {
+        fd_set set;
+        FD_ZERO(&set);
+        FD_SET(fd, &set);
+
+        struct timeval tv = {0, 100000};
+        int res = select(fd + 1, read ? &set : NULL, read ? NULL : &set, NULL, &tv);
+
+        if (res > 0) return true;
+        if (res < 0) {
+             if (errno == EINTR) continue;
+             return false;
+        }
+    }
+    return false;
+}
+
+static ssize_t read_bytes_fully(int fd, void *buf, size_t len, struct ocam_source *s) {
     size_t total_read = 0;
-    while (total_read < len) {
+    while (total_read < len && s->thread_running) {
+        if (!wait_for_socket(fd, s, true)) return -1;
+        
         ssize_t bytes_read = recv(fd, (char*)buf + total_read, (int)(len - total_read), 0);
         if (bytes_read <= 0) return bytes_read;
         total_read += bytes_read;
     }
     return total_read;
+}
+
+static int accept_with_timeout(int server_fd, struct ocam_source *s) {
+    if (!wait_for_socket(server_fd, s, true)) return -1;
+    return (int)accept(server_fd, NULL, NULL);
 }
 
 static void send_control_command(struct ocam_source *s, uint8_t cmd_id, uint32_t arg1, uint32_t arg2) {
@@ -174,7 +200,6 @@ static int create_bind_socket(int port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
     #endif
 
-    // Enable TCP_NODELAY for lower latency
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
 
     address.sin_family = AF_INET;
@@ -218,9 +243,7 @@ static void *control_thread_func(void *data) {
     uint8_t trash_buffer[1024];
 
     while (s->thread_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client = (int)accept(s->control_server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client = accept_with_timeout(s->control_server_fd, s);
 
         if (client < 0) continue;
         if (!s->thread_running) { CLOSESOCKET(client); break; }
@@ -239,14 +262,14 @@ static void *control_thread_func(void *data) {
 
         while (s->thread_running) {
             uint8_t header[5];
-            if (read_bytes_fully(client, header, 5) <= 0) break;
+            if (read_bytes_fully(client, header, 5, s) <= 0) break;
 
             uint8_t pkt_type = header[0];
             uint32_t payload_len = portable_ntohl(*(uint32_t*)(header + 1));
 
             if (pkt_type == 0x10) {
                 uint8_t *payload = malloc(payload_len);
-                if (read_bytes_fully(client, payload, payload_len) == payload_len) {
+                if (read_bytes_fully(client, payload, payload_len, s) == payload_len) {
 
                     pthread_mutex_lock(&s->mutex);
                     int offset = 0;
@@ -280,7 +303,7 @@ static void *control_thread_func(void *data) {
                 size_t remaining = payload_len;
                 while(remaining > 0) {
                     size_t to_read = (remaining > sizeof(trash_buffer)) ? sizeof(trash_buffer) : remaining;
-                    if (read_bytes_fully(client, trash_buffer, to_read) <= 0) break;
+                    if (read_bytes_fully(client, trash_buffer, to_read, s) <= 0) break;
                     remaining -= to_read;
                 }
             }
@@ -463,14 +486,11 @@ static void *network_thread_func(void *data) {
     if (listen(s->video_server_fd, 1) < 0) { CLOSESOCKET(s->video_server_fd); return NULL; }
 
     while (s->thread_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client = (int)accept(s->video_server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client = accept_with_timeout(s->video_server_fd, s);
 
         if (client < 0) continue;
         if (!s->thread_running) { CLOSESOCKET(client); break; }
         
-        // TCP_NODELAY
         int opt = 1;
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (SOCKOPT_VAL_TYPE)&opt, sizeof(opt));
 
@@ -480,7 +500,7 @@ static void *network_thread_func(void *data) {
 
         char name[NAME_BUFFER_SIZE];
         uint32_t config[3];
-        if (read_bytes_fully(client, name, NAME_BUFFER_SIZE) <= 0 || read_bytes_fully(client, config, sizeof(config)) <= 0) {
+        if (read_bytes_fully(client, name, NAME_BUFFER_SIZE, s) <= 0 || read_bytes_fully(client, config, sizeof(config), s) <= 0) {
             CLOSESOCKET(client); continue;
         }
 
@@ -494,14 +514,14 @@ static void *network_thread_func(void *data) {
             uint64_t pts_net;
             uint32_t size_net;
 
-            if (read_bytes_fully(client, &pts_net, sizeof(pts_net)) <= 0) break;
-            if (read_bytes_fully(client, &size_net, sizeof(size_net)) <= 0) break;
+            if (read_bytes_fully(client, &pts_net, sizeof(pts_net), s) <= 0) break;
+            if (read_bytes_fully(client, &size_net, sizeof(size_net), s) <= 0) break;
 
             uint64_t pts = portable_ntohll(pts_net);
             uint32_t size = portable_ntohl(size_net);
 
             if (av_new_packet(packet, size) < 0) break;
-            if (read_bytes_fully(client, packet->data, size) != size) { av_packet_unref(packet); break; }
+            if (read_bytes_fully(client, packet->data, size, s) != size) { av_packet_unref(packet); break; }
 
             // PTS 0 = Config Packet (Stream Restart)
             if (pts == 0) {
@@ -608,9 +628,7 @@ static void *audio_thread_func(void *data) {
     if (listen(s->audio_server_fd, 1) < 0) { CLOSESOCKET(s->audio_server_fd); return NULL; }
 
     while (s->thread_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client = (int)accept(s->audio_server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client = accept_with_timeout(s->audio_server_fd, s);
 
         if (client < 0) continue;
         if (!s->thread_running) { CLOSESOCKET(client); break; }
@@ -625,7 +643,7 @@ static void *audio_thread_func(void *data) {
 
         // Handshake: Read 4 bytes magic "AAC "
         uint32_t magic;
-        if (read_bytes_fully(client, &magic, sizeof(magic)) <= 0) {
+        if (read_bytes_fully(client, &magic, sizeof(magic), s) <= 0) {
             CLOSESOCKET(client); continue;
         }
 
@@ -639,14 +657,14 @@ static void *audio_thread_func(void *data) {
             uint64_t pts_net;
             uint32_t size_net;
 
-            if (read_bytes_fully(client, &pts_net, sizeof(pts_net)) <= 0) break;
-            if (read_bytes_fully(client, &size_net, sizeof(size_net)) <= 0) break;
+            if (read_bytes_fully(client, &pts_net, sizeof(pts_net), s) <= 0) break;
+            if (read_bytes_fully(client, &size_net, sizeof(size_net), s) <= 0) break;
 
             uint64_t pts = portable_ntohll(pts_net);
             uint32_t size = portable_ntohl(size_net);
 
             if (av_new_packet(packet, size) < 0) break;
-            if (read_bytes_fully(client, packet->data, size) != size) { av_packet_unref(packet); break; }
+            if (read_bytes_fully(client, packet->data, size, s) != size) { av_packet_unref(packet); break; }
 
             // Init codec if needed (using first packet as config/data)
             if (!s->audio_codec_initialized) {
@@ -717,21 +735,6 @@ static void *audio_thread_func(void *data) {
 
 // --- Main Lifecycle ---
 
-static void force_unblock_socket(int port) {
-    int sock = (int)socket(AF_INET, SOCK_STREAM, 0);
-    if (sock >= 0) {
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        // "127.0.0.1"
-        addr.sin_addr.s_addr = htonl(0x7F000001); 
-
-        connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-        CLOSESOCKET(sock);
-    }
-}
-
 static void ocam_destroy(void *data) {
     struct ocam_source *s = data;
     s->thread_running = false;
@@ -745,10 +748,6 @@ static void ocam_destroy(void *data) {
     if (s->control_server_fd != -1) { shutdown(s->control_server_fd, SHUTDOWN_FLAGS); CLOSESOCKET(s->control_server_fd); s->control_server_fd = -1; }
     if (s->audio_server_fd != -1) { shutdown(s->audio_server_fd, SHUTDOWN_FLAGS); CLOSESOCKET(s->audio_server_fd); s->audio_server_fd = -1; }
     pthread_mutex_unlock(&s->mutex);
-
-    force_unblock_socket(VIDEO_PORT);
-    force_unblock_socket(CONTROL_PORT);
-    force_unblock_socket(AUDIO_PORT);
 
     if (s->network_thread_active) pthread_join(s->network_thread, NULL);
     if (s->control_thread_active) pthread_join(s->control_thread, NULL);
