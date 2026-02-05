@@ -17,6 +17,7 @@ class ControlServer(
 ) {
     private val port = 27184
     private var running = true
+    private var currentSocket: Socket? = null
 
     @OptIn(DelicateCoroutinesApi::class)
     fun start() {
@@ -25,6 +26,7 @@ class ControlServer(
             while (running) {
                 try {
                     val socket = Socket("127.0.0.1", port)
+                    currentSocket = socket
                     handleConnection(socket)
                 } catch (_: Exception) {
                     Thread.sleep(2000)
@@ -33,7 +35,13 @@ class ControlServer(
         }
     }
 
-    fun stop() { running = false }
+    fun stop() {
+        running = false
+        try {
+            currentSocket?.close()
+        } catch (_: Exception) { }
+        currentSocket = null
+    }
 
     private fun handleConnection(sock: Socket) {
         val input = DataInputStream(sock.getInputStream())
