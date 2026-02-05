@@ -24,9 +24,18 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.NetworkCheck
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -35,12 +44,11 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -54,6 +62,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
@@ -73,13 +82,14 @@ import java.net.Socket
 // Helper data class for Dropdowns
 data class DeviceOption(val id: String, val name: String, val intId: Int = -1)
 
-// --- Custom Matte Colors ---
-val MatteBackground = Color(0xFF121212)
-val MatteSurface = Color(0xFF1E1E1E)
-val MatteTeal = Color(0xFF00796B)
-val MatteRed = Color(0xFFD32F2F)
-val TextPrimary = Color(0xFFE0E0E0)
-val TextSecondary = Color(0xFFA0A0A0)
+// --- Custom Matte Palette ---
+val MatteBackground = Color(0xFF0D0D0F)
+val MatteSurface = Color(0xFF161619)
+val MatteAccent = Color(0xFF915FF2) // Vibrant Purple
+val MatteSuccess = Color(0xFF00C896) // Emerald
+val MatteError = Color(0xFFF25F5F)
+val MatteTextPrimary = Color(0xFFF5F5F7)
+val MatteTextSecondary = Color(0xFF8E8E93)
 
 class MainActivity : ComponentActivity() {
     @RequiresApi(Build.VERSION_CODES.P)
@@ -88,12 +98,7 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContent {
             OCamTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MatteBackground
-                ) {
-                    MainScreen()
-                }
+                MainScreen()
             }
         }
     }
@@ -162,44 +167,73 @@ fun MainScreen() {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(scrollState),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .background(MatteBackground)
+            .verticalScroll(rememberScrollState())
+            .padding(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // --- Header ---
+        // --- HEADER ---
         Text(
             text = "OCam",
-            color = TextPrimary,
-            fontSize = 28.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(top = 16.dp, bottom = 4.dp)
+            fontSize = 32.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = MatteAccent,
+            modifier = Modifier.padding(top = 8.dp)
         )
         Text(
-            text = "TCP Stream Client",
-            color = TextSecondary,
-            fontSize = 14.sp
+            text = "Stream Client",
+            color = MatteTextSecondary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium
         )
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // --- STATUS CARD ---
+        SettingsCard(title = "Connection Status", icon = Icons.Filled.NetworkCheck) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(if (isStreaming) MatteSuccess else MatteTextSecondary)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (isStreaming) "Broadcasting" else "Standby",
+                    color = MatteTextPrimary,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Text(
+                text = statusText,
+                color = MatteTextSecondary,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
 
         if (!hasPermissions) {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF2C1B1B)),
-                modifier = Modifier.fillMaxWidth()
+                colors = CardDefaults.cardColors(containerColor = MatteError.copy(alpha = 0.1f)),
+                modifier = Modifier.fillMaxWidth(),
+                border = androidx.compose.foundation.BorderStroke(1.dp, MatteError.copy(alpha = 0.3f))
             ) {
                 Text(
-                    "Camera & Audio permissions required.",
-                    color = Color(0xFFFF8A80),
-                    modifier = Modifier.padding(16.dp)
+                    "Permissions required to access camera/mic.",
+                    color = MatteError,
+                    modifier = Modifier.padding(16.dp),
+                    fontSize = 14.sp
                 )
             }
             return@Column
         }
 
-        // --- Video Section ---
-        SettingsCard(title = "Video Settings") {
+        // --- VIDEO SECTION ---
+        SettingsCard(title = "Video Source", icon = Icons.Filled.Videocam) {
             DropdownDeviceSelector(
-                label = "Camera Source",
+                label = "Camera",
                 options = cameraOptions,
                 selected = selectedCamera,
                 onSelected = { selectedCamera = it },
@@ -209,80 +243,80 @@ fun MainScreen() {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // --- Audio Section ---
-        SettingsCard(title = "Audio Settings") {
-            // Audio Toggle
+        // --- AUDIO SECTION ---
+        SettingsCard(title = "Audio Controls", icon = Icons.Filled.Mic) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column {
-                    Text("Send Audio", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                    Text("Enable microphone stream", color = TextSecondary, fontSize = 12.sp)
+                    Text("Audio Feed", color = MatteTextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Capture microphone", color = MatteTextSecondary, fontSize = 12.sp)
                 }
                 Switch(
                     checked = isAudioEnabled,
                     onCheckedChange = { if (!isStreaming) isAudioEnabled = it },
                     enabled = !isStreaming,
                     colors = SwitchDefaults.colors(
-                        checkedThumbColor = MatteTeal,
-                        checkedTrackColor = MatteTeal.copy(alpha = 0.5f)
+                        checkedThumbColor = MatteAccent,
+                        checkedTrackColor = MatteAccent.copy(alpha = 0.4f),
+                        uncheckedThumbColor = MatteTextSecondary,
+                        uncheckedTrackColor = MatteSurface
                     )
                 )
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Microphone Selection (Visible only if Audio enabled)
-            val audioControlsAlpha = if (isAudioEnabled) 1f else 0.4f
-
-            Column(modifier = Modifier.alpha(audioControlsAlpha)) {
+            if (isAudioEnabled) {
+                Spacer(modifier = Modifier.height(16.dp))
+                
                 DropdownDeviceSelector(
-                    label = "Microphone Source",
+                    label = "Input Device",
                     options = micOptions,
                     selected = selectedMic,
                     onSelected = { selectedMic = it },
-                    enabled = !isStreaming && isAudioEnabled
+                    enabled = !isStreaming
                 )
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // Volume Slider
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Gain: ${(volume * 100).toInt()}%", color = TextSecondary, fontSize = 14.sp)
+                    Icon(
+                        imageVector = Icons.Filled.VolumeUp,
+                        contentDescription = null,
+                        tint = MatteTextSecondary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Gain: ${(volume * 100).toInt()}%", color = MatteTextSecondary, fontSize = 13.sp)
                 }
+                
                 Slider(
                     value = volume,
                     onValueChange = { volume = it },
-                    valueRange = 0f..5f,
-                    steps = 49,
-                    enabled = isAudioEnabled,
+                    valueRange = 0f..2f,
                     colors = SliderDefaults.colors(
-                        thumbColor = MatteTeal,
-                        activeTrackColor = MatteTeal,
-                        inactiveTrackColor = Color.Gray
+                        thumbColor = MatteAccent,
+                        activeTrackColor = MatteAccent,
+                        inactiveTrackColor = MatteSurface
                     )
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        // --- Action Button ---
         Button(
             onClick = {
                 if (isStreaming) {
-                    // STOP
                     isStreaming = false
-                    statusText = "Stopping..."
+                    statusText = "Stopping session..."
                     streamJob?.cancel()
                     activeAudioStreamer = null
                 } else {
-                    // START
                     if (selectedCamera == null) return@Button
                     isStreaming = true
-                    statusText = "Connecting..."
+                    statusText = "Initiating connection..."
                     streamJob = scope.launch(Dispatchers.IO) {
                         runTCPStreamingSession(
                             context = context,
@@ -296,7 +330,7 @@ fun MainScreen() {
                         )
                         withContext(Dispatchers.Main) {
                             isStreaming = false
-                            statusText = "Disconnected / Ready"
+                            statusText = "Connection closed"
                             activeAudioStreamer = null
                         }
                     }
@@ -304,52 +338,54 @@ fun MainScreen() {
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp),
-            shape = RoundedCornerShape(12.dp),
+                .height(60.dp),
+            shape = RoundedCornerShape(16.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (isStreaming) MatteRed else MatteTeal,
+                containerColor = if (isStreaming) MatteError else MatteAccent,
                 contentColor = Color.White
-            ),
-            elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp)
+            )
         ) {
+            Icon(
+                imageVector = if (isStreaming) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                contentDescription = null,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = if (isStreaming) "STOP STREAM" else "START STREAM",
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
+                text = if (isStreaming) "END BROADCAST" else "START BROADCAST",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.ExtraBold
             )
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Status Text
-        Box(
-            modifier = Modifier
-                .background(Color(0xFF252525), RoundedCornerShape(8.dp))
-                .padding(horizontal = 12.dp, vertical = 6.dp)
-        ) {
-            Text(text = statusText, color = Color(0xFFFFD54F), fontSize = 14.sp)
-        }
-
-        Spacer(modifier = Modifier.height(40.dp))
     }
 }
 
-// --- UI Components ---
+// --- REFINED UI COMPONENTS ---
 
 @Composable
-fun SettingsCard(title: String, content: @Composable () -> Unit) {
+fun SettingsCard(title: String, icon: androidx.compose.ui.graphics.vector.ImageVector, content: @Composable () -> Unit) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MatteSurface),
-        shape = RoundedCornerShape(16.dp),
-        modifier = Modifier.fillMaxWidth(),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        shape = RoundedCornerShape(20.dp),
+        modifier = Modifier.fillMaxWidth()
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 12.dp)) {
-                Text(title, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+        Column(modifier = Modifier.padding(20.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = MatteAccent,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Text(
+                    text = title,
+                    color = MatteTextPrimary,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp
+                )
             }
-            HorizontalDivider(color = Color.Gray.copy(alpha = 0.2f))
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(16.dp))
             content()
         }
     }
@@ -371,21 +407,24 @@ fun DropdownDeviceSelector(
         onExpandedChange = { if (enabled) expanded = it }
     ) {
         OutlinedTextField(
-            value = selected?.name ?: "Select Device",
+            value = selected?.name ?: "Select source",
             onValueChange = {},
             readOnly = true,
-            label = { Text(label, color = TextSecondary) },
+            label = { Text(label, color = MatteTextSecondary) },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             colors = OutlinedTextFieldDefaults.colors(
-                focusedTextColor = TextPrimary,
-                unfocusedTextColor = TextPrimary,
-                disabledTextColor = TextSecondary,
-                focusedBorderColor = MatteTeal,
-                unfocusedBorderColor = Color.Gray,
-                focusedLabelColor = MatteTeal,
-                unfocusedLabelColor = TextSecondary
+                focusedTextColor = MatteTextPrimary,
+                unfocusedTextColor = MatteTextPrimary,
+                disabledTextColor = MatteTextSecondary,
+                focusedBorderColor = MatteAccent,
+                unfocusedBorderColor = MatteSurface,
+                focusedLabelColor = MatteAccent,
+                unfocusedLabelColor = MatteTextSecondary,
+                focusedContainerColor = MatteBackground.copy(alpha = 0.5f),
+                unfocusedContainerColor = MatteBackground.copy(alpha = 0.5f)
             ),
             enabled = enabled,
+            shape = RoundedCornerShape(12.dp),
             modifier = Modifier
                 .menuAnchor()
                 .fillMaxWidth()
@@ -397,7 +436,7 @@ fun DropdownDeviceSelector(
         ) {
             options.forEach { option ->
                 DropdownMenuItem(
-                    text = { Text(option.name, color = TextPrimary) },
+                    text = { Text(option.name, color = MatteTextPrimary) },
                     onClick = {
                         onSelected(option)
                         expanded = false
@@ -444,8 +483,8 @@ suspend fun runTCPStreamingSession(
         System.arraycopy(deviceName.toByteArray(), 0, nameBytes, 0, minOf(deviceName.length, 64))
         outputStream.write(nameBytes)
         outputStream.writeInt(0x68323634) // H264
-        outputStream.writeInt(1280)
-        outputStream.writeInt(720)
+        outputStream.writeInt(640)
+        outputStream.writeInt(480)
         outputStream.flush()
 
         // 2. Audio Connection (Only if Toggle is ON)
@@ -465,8 +504,13 @@ suspend fun runTCPStreamingSession(
 
         withContext(Dispatchers.Main) {
             // Start Camera
-            videoStreamer = CameraStreamer(context, videoSocket, cameraId)
-            videoStreamer.start()
+            videoStreamer = CameraStreamer(context, videoSocket, cameraId).apply {
+                onConfigChanged = { conf ->
+                    val mbps = conf.bitrate / 1_000_000f
+                    onStatusUpdate("Live: ${conf.width}x${conf.height} @ ${conf.fps} FPS (%.1f Mbps)".format(mbps))
+                }
+            }
+            videoStreamer?.start()
 
             // Start Audio if socket exists and is connected
             if (audioSocket != null && audioSocket.isConnected) {

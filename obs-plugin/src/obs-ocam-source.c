@@ -259,6 +259,7 @@ static void *control_thread_func(void *data) {
                     s->exp_max = (int32_t)portable_ntohl(*(uint32_t*)(payload + offset)); offset += 4;
                     s->focus_min = befloattoh(*(uint32_t*)(payload + offset)); offset += 4;
                     s->flash_available = payload[offset++];
+
                     s->caps_received = true;
                     pthread_mutex_unlock(&s->mutex);
 
