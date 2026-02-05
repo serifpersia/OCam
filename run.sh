@@ -103,7 +103,7 @@ fetch_latest_release() {
     fi
 
     API_URL="https://api.github.com/repos/serifpersia/OCam/releases/latest"
-    DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name == "OCam-v1.0.0.zip") | .browser_download_url')
+    DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name == "OCam.zip") | .browser_download_url')
 
     if [ -z "$DOWNLOAD_URL" ]; then
         echo "Could not find the latest release zip file."

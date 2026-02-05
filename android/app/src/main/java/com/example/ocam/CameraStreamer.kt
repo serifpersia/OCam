@@ -40,7 +40,7 @@ data class ManualControls(
 class CameraStreamer(
     private val context: Context,
     socket: Socket,
-    val cameraId: String, // Added: Specific Camera ID to open
+    val cameraId: String,
     var onConfigChanged: ((StreamConfig) -> Unit)? = null
 ) {
     private var cameraDevice: CameraDevice? = null
@@ -278,10 +278,8 @@ class CameraStreamer(
     }
 
     private fun applyManualsToBuilder(builder: CaptureRequest.Builder) {
-        // Use requested FPS directly
         builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(config.fps, config.fps))
         
-        // CRITICAL: Prevent AE from suppressing frame rate
         if (manual.iso <= 0 && manual.exposureUs <= 0) {
             builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
             builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
